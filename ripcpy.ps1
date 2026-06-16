@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory)][string] $Source,
     [Parameter(Mandatory)][string] $Target,
-    [int] $Parallel = 8,    # concurrent robocopy processes (level-1 parallelism)
+    [int] $Parallel = 12,    # concurrent robocopy processes (level-1 parallelism)
     [int] $Threads  = 32,   # robocopy /MT per process      (level-2 parallelism)
     [int] $MaxDepth = 8,    # max depth to recurse when breaking up fat directories
     [int] $Spread   = 3     # job granularity multiplier; higher = more/smaller jobs
