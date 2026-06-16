@@ -8,28 +8,52 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# Resolves $Source to its full absolute path
 $srcFull = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
 
 function Get-RelDst([string]$path) {
     $rel = $path.Substring($srcFull.Length).TrimStart('\')
     if ($rel) { Join-Path $Target $rel } else { $Target }
 }
-function Get-FileCount([string]$dir) {
-    (Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+
+# ---- 0. SINGLE-PASS SCAN ----------------------------------------------------
+# Enumerate every file ONCE, then derive per-directory metadata by walking each
+# file's ancestor chain. This replaces repeated recursive Get-ChildItem counts
+# (O(depth x N)) with a single O(N) walk + O(1) hash lookups during planning.
+$recCount    = @{}   # dir -> recursive file count (dir + all descendants)
+$directCount = @{}   # dir -> files directly in dir (non-recursive)
+$children    = @{}   # dir -> set of immediate child dirs that contain files
+
+foreach ($f in (Get-ChildItem -LiteralPath $srcFull -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+    $parent = [System.IO.Path]::GetDirectoryName($f.FullName)
+    $directCount[$parent] = ($directCount[$parent] ?? 0) + 1
+
+    # Walk from the file's parent up to the source root, tallying each ancestor.
+    $cur = $parent
+    while ($true) {
+        $recCount[$cur] = ($recCount[$cur] ?? 0) + 1
+        if ($cur.Length -le $srcFull.Length) { break }
+        $up = [System.IO.Path]::GetDirectoryName($cur)
+        if (-not $children.ContainsKey($up)) {
+            $children[$up] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        }
+        [void]$children[$up].Add($cur)
+        $cur = $up
+    }
 }
 
 # ---- 1. RECURSIVE SPLIT -----------------------------------------------------
-# Walk the tree, breaking up any directory whose file-count exceeds the target
-# bucket-share. A "subtree" job copies a whole directory (robocopy /E, internally
-# threaded). A "files" job copies only the loose files in a split node (no /E).
-$total  = Get-FileCount $srcFull
+# Break up any directory whose file-count exceeds the target bucket-share. A
+# "subtree" job copies a whole directory (robocopy /E, internally threaded); a
+# "files" job copies only the loose files in a split node (no /E).
+$total = $recCount[$srcFull] ?? 0
 if ($total -eq 0) { Write-Host "Nothing to copy."; exit 0 }
 $shareTarget = [math]::Max(1, [math]::Ceiling($total / ($Parallel * $Spread)))
 
 $jobs = [System.Collections.Generic.List[object]]::new()
 
 function Add-Jobs([string]$dir, [int]$depth, [int]$weight) {
-    $subdirs = @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue)
+    $subdirs = if ($children.ContainsKey($dir)) { @($children[$dir]) } else { @() }
 
     # Stop descending: small enough, hit max depth, or can't split (leaf dir).
     if ($weight -le $shareTarget -or $depth -ge $MaxDepth -or $subdirs.Count -eq 0) {
@@ -38,12 +62,12 @@ function Add-Jobs([string]$dir, [int]$depth, [int]$weight) {
     }
 
     # Loose files directly in this split node get their own non-recursive job.
-    $direct = (Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+    $direct = $directCount[$dir] ?? 0
     if ($direct -gt 0) {
         $jobs.Add([pscustomobject]@{ Src = $dir; Dst = (Get-RelDst $dir); Recurse = $false; Weight = $direct })
     }
     foreach ($sd in $subdirs) {
-        Add-Jobs $sd.FullName ($depth + 1) (Get-FileCount $sd.FullName)
+        Add-Jobs $sd ($depth + 1) ($recCount[$sd] ?? 0)
     }
 }
 Add-Jobs $srcFull 0 $total
