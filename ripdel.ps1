@@ -297,15 +297,21 @@ $total = $recCount[$target] ?? 0
 # ============================================================================================
 # ---- 1. SPLIT ----------------------------------------------------------------
 # Break fat directories into subtree jobs. Unlike ripcpy, we only emit subtree
-# jobs (no files-only) — stray loose files at split nodes are cleaned up after.
+# Emit subtree jobs AND files-only jobs at split nodes.
+# Files-only jobs use robocopy without /MIR to delete only top-level files,
+# leaving child directories for their own subtree jobs.
 $shareTarget = [math]::Max(1, [math]::Ceiling($total / ($Parallel * $Spread)))
 $jobs = [System.Collections.Generic.List[object]]::new()
 
 function Add-Jobs([string]$dir, [int]$depth, [int]$weight) {
     $subdirs = if ($children.ContainsKey($dir)) { @($children[$dir]) } else { @() }
     if ($weight -le $shareTarget -or $depth -ge $MaxDepth -or $subdirs.Count -eq 0) {
-        $jobs.Add([pscustomobject]@{ Dir = $dir; Weight = $weight })
+        $jobs.Add([pscustomobject]@{ Dir = $dir; Weight = $weight; FilesOnly = $false })
         return
+    }
+    $direct = $directCount[$dir] ?? 0
+    if ($direct -gt 0) {
+        $jobs.Add([pscustomobject]@{ Dir = $dir; Weight = $direct; FilesOnly = $true })
     }
     foreach ($sd in $subdirs) { Add-Jobs $sd ($depth + 1) ($recCount[$sd] ?? 0) }
 }
@@ -339,7 +345,13 @@ try {
         $pfx      = $using:pathPrefix
         $cw       = $using:colW
         $jobSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $out = robocopy $emptyDir $_.Dir /MIR /MT:$threads /R:1 /W:1
+        if ($_.FilesOnly) {
+            # Delete only top-level files, leave subdirs for their own jobs
+            $out = robocopy $emptyDir $_.Dir /MT:$threads /R:1 /W:1
+        } else {
+            # Full recursive mirror — deletes everything in this subtree
+            $out = robocopy $emptyDir $_.Dir /MIR /MT:$threads /R:1 /W:1
+        }
         $code = $LASTEXITCODE
         $jobSw.Stop()
         $filesLine = ($out | Where-Object { $_ -match '^\s*Files :\s+\d' } | Select-Object -Last 1)
