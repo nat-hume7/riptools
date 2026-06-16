@@ -106,18 +106,25 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 $results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
     $threads = $using:Threads
+    $jobSw = [System.Diagnostics.Stopwatch]::StartNew()
     if ($_.Recurse) { $out = robocopy $_.Src $_.Dst /E /MT:$threads /R:1 /W:1 }
     else            { $out = robocopy $_.Src $_.Dst    /MT:$threads /R:1 /W:1 }
     $code = $LASTEXITCODE
+    $jobSw.Stop()
     $filesLine = ($out | Where-Object { $_ -match '^\s*Files :\s+\d' } | Select-Object -Last 1)
+    $name = Split-Path $_.Dst -Leaf
+    $info = if ($filesLine) { $filesLine.Trim() } else { "$($_.Weight) files" }
+    $status = if ($code -ge 8) { 'FAIL' } else { 'ok' }
+    Write-Host ("  [{0}] {1}  {2}  ({3:N1}s)" -f $status, $name, $info, $jobSw.Elapsed.TotalSeconds)
     [pscustomobject]@{ Dst = $_.Dst; Code = $code; Files = $filesLine; Output = $out }
 } -ThrottleLimit $Parallel
 
 # Robocopy exit codes: <8 = success (1=copied, 2=extras, 3=both...); 8=failures, 16=fatal.
 foreach ($r in $results) {
-    Write-Host ("[{0}] {1}" -f $r.Code, (Split-Path $r.Dst -Leaf)) -NoNewline
-    if ($r.Files) { Write-Host ("  {0}" -f $r.Files.Trim()) } else { Write-Host "" }
-    if ($r.Code -ge 8) { $r.Output | ForEach-Object { Write-Host "    $_" } }
+    if ($r.Code -ge 8) {
+        Write-Host ("`n  FAILED: {0}" -f (Split-Path $r.Dst -Leaf))
+        $r.Output | ForEach-Object { Write-Host "    $_" }
+    }
 }
 
 $worst = ($results | ForEach-Object Code | Measure-Object -Maximum).Maximum
