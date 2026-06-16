@@ -103,6 +103,10 @@ public static class RestartManager {
 }
 '@ -ErrorAction SilentlyContinue
 
+# How it works:
+#  1. Look for handle.exe next to the script (where install.ps1 puts it → ~/.riptools/handle.exe)
+#  2. If not there, check PATH for handle.exe or handle64.exe
+#  3. If $handleExe is still $null/empty, Tier 3 silently skips — no error, no warning
 $handleExe = Join-Path $PSScriptRoot 'handle.exe'
 if (-not (Test-Path $handleExe)) {
     $handleExe = (Get-Command handle.exe -ErrorAction SilentlyContinue)?.Source
@@ -317,7 +321,9 @@ $emptyDir = Join-Path ([System.IO.Path]::GetTempPath()) "ripdel-empty-$PID"
 
 try {
     Write-Host ("Deleting: {0}" -f $target)
-    Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total.`n" -f $jobs.Count, $Parallel, $total)
+    Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total." -f $jobs.Count, $Parallel, $total)
+    Write-Host ("        {0,-20} {1}" -f 'Name', 'Total  Copied  Skipped  Mismatch  FAILED  Extras')
+    Write-Host ""
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     $results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
@@ -331,7 +337,7 @@ try {
         $name = Split-Path $_.Dir -Leaf
         $info = if ($filesLine) { $filesLine.Trim() } else { "$($_.Weight) files" }
         $status = if ($code -ge 8) { 'FAIL' } else { 'ok' }
-        Write-Host ("  [{0}] {1}  {2}  ({3:N1}s)" -f $status, $name, $info, $jobSw.Elapsed.TotalSeconds)
+        Write-Host ("  [{0}] {1,-20} {2}  ({3:N1}s)" -f $status, $name, $info, $jobSw.Elapsed.TotalSeconds)
         [pscustomobject]@{ Dir = $_.Dir; Code = $code; Output = $out }
     } -ThrottleLimit $Parallel
 

@@ -111,8 +111,10 @@ Add-Jobs $srcFull 0 $total
 # Feed jobs (heaviest-first) into a parallel pipeline with ThrottleLimit acting
 # as a natural work queue: as each robocopy finishes, the next job starts
 # immediately. No static bucket assignment — no workers ever idle while work remains.
-Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total.`n" -f `
+Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total." -f `
     $jobs.Count, $Parallel, $total)
+Write-Host ("        {0,-20} {1}" -f 'Name', 'Total  Copied  Skipped  Mismatch  FAILED  Extras')
+Write-Host ""
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -127,7 +129,7 @@ $results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
     $name = Split-Path $_.Dst -Leaf
     $info = if ($filesLine) { $filesLine.Trim() } else { "$($_.Weight) files" }
     $status = if ($code -ge 8) { 'FAIL' } else { 'ok' }
-    Write-Host ("  [{0}] {1}  {2}  ({3:N1}s)" -f $status, $name, $info, $jobSw.Elapsed.TotalSeconds)
+    Write-Host ("  [{0}] {1,-20} {2}  ({3:N1}s)" -f $status, $name, $info, $jobSw.Elapsed.TotalSeconds)
     [pscustomobject]@{ Dst = $_.Dst; Code = $code; Files = $filesLine; Output = $out }
 } -ThrottleLimit $Parallel
 
