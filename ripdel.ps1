@@ -1,113 +1,134 @@
 param(
-    [Parameter(Mandatory)][string] $Dir
+    [Parameter(Mandatory)][string] $Path,
+    [int] $Parallel = 8,    # concurrent robocopy /MIR processes
+    [int] $Threads  = 32,   # robocopy /MT per process
+    [int] $MaxDepth = 8,    # max depth to recurse when splitting fat directories
+    [int] $Spread   = 3     # job granularity multiplier; higher = more/smaller jobs
 )
+$ErrorActionPreference = 'Stop'
 
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-
-public class RestartManager {
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RM_UNIQUE_PROCESS {
-        public int dwProcessId;
-        public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    public struct RM_PROCESS_INFO {
-        public RM_UNIQUE_PROCESS Process;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
-        public string strAppName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
-        public string strServiceShortName;
-        public int ApplicationType;
-        public uint AppStatus;
-        public int TSSessionId;
-        [MarshalAs(UnmanagedType.Bool)]
-        public bool bRestartable;
-    }
-
-    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
-    public static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
-
-    [DllImport("rstrtmgr.dll")]
-    public static extern int RmEndSession(uint pSessionHandle);
-
-    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
-    public static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames,
-        uint nApplications, [In] RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
-
-    [DllImport("rstrtmgr.dll")]
-    public static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo,
-        [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+$target = (Get-Item -LiteralPath $Path).FullName.TrimEnd('\')
+if (-not (Test-Path -LiteralPath $target -PathType Container)) {
+    Write-Error "Target is not a directory: $target"; exit 1
 }
-'@
 
-function Get-LockingProcesses([string[]]$Files) {
-    $sessionKey = [guid]::NewGuid().ToString()
-    $session = [uint32]0
-    if ([RestartManager]::RmStartSession([ref]$session, 0, $sessionKey) -ne 0) {
-        Write-Warning "RmStartSession failed"; return @()
-    }
+# ---- 0. SCAN -----------------------------------------------------------------
+# Walk the target tree down to $MaxDepth building per-directory file counts.
+# At MaxDepth, bulk-count via .NET enumeration (no per-file PowerShell overhead).
+$recCount    = @{}   # dir -> recursive file count
+$directCount = @{}   # dir -> files directly in dir
+$children    = @{}   # dir -> set of immediate child dirs containing files
+
+$bulkEnumOpts = [System.IO.EnumerationOptions]@{ RecurseSubdirectories = $true; IgnoreInaccessible = $true }
+
+function Scan-Dir([string]$dir, [int]$depth) {
     try {
-        [RestartManager]::RmRegisterResources($session, [uint32]$Files.Count, $Files, 0, $null, 0, $null) | Out-Null
-        $needed = [uint32]0; $count = [uint32]0; $reason = [uint32]0
-        # First call: get count
-        [RestartManager]::RmGetList($session, [ref]$needed, [ref]$count, $null, [ref]$reason) | Out-Null
-        if ($needed -eq 0) { return @() }
-        # Second call: get actual data
-        $infoType = [RestartManager].Assembly.GetType('RestartManager+RM_PROCESS_INFO')
-        $procs    = [System.Array]::CreateInstance($infoType, [int]$needed)
-        $count    = $needed
-        [RestartManager]::RmGetList($session, [ref]$needed, [ref]$count, $procs, [ref]$reason) | Out-Null
-        return $procs[0..([int]$count - 1)]
-    } finally {
-        [RestartManager]::RmEndSession($session) | Out-Null
-    }
-}
+        $subdirs = [System.IO.Directory]::GetDirectories($dir)
+        $files   = [System.IO.Directory]::GetFiles($dir).Length
+    } catch [System.UnauthorizedAccessException] { return }
+    $directCount[$dir] = $files
+    $total = $files
 
-function Invoke-RobocopyMir([string]$Src, [string]$Dst) {
-    $lines = robocopy $Src $Dst /MIR /MT:32 /R:1 /W:1
-    $lines | ForEach-Object { Write-Host $_ }
-    # Robocopy error lines: "ERROR 32 (0x00000020) Deleting File C:\path\file.txt"
-    $failed = $lines |
-        Where-Object   { $_ -match 'ERROR.*(?:Deleting|Copying)\s+(?:File|Dir)\s+(.+)$' } |
-        ForEach-Object { $Matches[1].Trim() }
-    return @{ ExitCode = $LASTEXITCODE; Failed = @($failed) }
-}
-
-$e = "$env:TEMP\robocopy_empty"
-New-Item $e -ItemType Directory -Force | Out-Null
-
-try {
-    $result = Invoke-RobocopyMir $e $Dir
-
-    if ($result.ExitCode -band 8) {
-        $failed = $result.Failed
-        if ($failed.Count -gt 0) {
-            Write-Host "`nFound $($failed.Count) locked file(s) — querying Restart Manager..."
-            $lockers = Get-LockingProcesses $failed
-            $killed  = 0
-            foreach ($l in $lockers) {
-                $tag = if ($l.bRestartable) { "restartable" } else { "NOT restartable" }
-                Write-Warning "Killing '$($l.strAppName)' (PID $($l.Process.dwProcessId)) — $tag"
-                Stop-Process -Id $l.Process.dwProcessId -Force -ErrorAction SilentlyContinue
-                $killed++
+    if ($depth -ge $MaxDepth -or $subdirs.Length -eq 0) {
+        foreach ($sd in $subdirs) {
+            $count = [System.Linq.Enumerable]::Count(
+                [System.IO.Directory]::EnumerateFiles($sd, '*', $bulkEnumOpts))
+            $recCount[$sd] = $count
+            $total += $count
+            if ($count -gt 0) {
+                if (-not $children.ContainsKey($dir)) {
+                    $children[$dir] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                }
+                [void]$children[$dir].Add($sd)
             }
-            if ($killed -gt 0) {
-                Write-Host "Retrying after killing $killed process(es)..."
-                $result = Invoke-RobocopyMir $e $Dir
+        }
+    } else {
+        foreach ($sd in $subdirs) {
+            Scan-Dir $sd ($depth + 1)
+            $total += $recCount[$sd]
+            if (($recCount[$sd] ?? 0) -gt 0) {
+                if (-not $children.ContainsKey($dir)) {
+                    $children[$dir] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                }
+                [void]$children[$dir].Add($sd)
             }
         }
     }
+    $recCount[$dir] = $total
+}
+Scan-Dir $target 0
 
-    if     ($result.ExitCode -band 16) { Write-Error   "FATAL: robocopy could not run." }
-    elseif ($result.ExitCode -band 8)  { Write-Warning "Some files still FAILED to delete." }
-    else {
-        Remove-Item $Dir -Force -ErrorAction SilentlyContinue
-        Write-Host "Done."
-    }
-} finally {
-    Remove-Item $e -Force -ErrorAction SilentlyContinue
+$total = $recCount[$target] ?? 0
+if ($total -eq 0) {
+    Remove-Item -LiteralPath $target -Recurse -Force
+    Write-Host "Removed (empty)."; exit 0
 }
 
+# ---- 1. SPLIT ----------------------------------------------------------------
+# Break fat directories into subtree jobs. Unlike ripcpy, we only emit subtree
+# jobs (no files-only) — stray loose files at split nodes are cleaned up after.
+$shareTarget = [math]::Max(1, [math]::Ceiling($total / ($Parallel * $Spread)))
+$jobs = [System.Collections.Generic.List[object]]::new()
+
+function Add-Jobs([string]$dir, [int]$depth, [int]$weight) {
+    $subdirs = if ($children.ContainsKey($dir)) { @($children[$dir]) } else { @() }
+
+    if ($weight -le $shareTarget -or $depth -ge $MaxDepth -or $subdirs.Count -eq 0) {
+        $jobs.Add([pscustomobject]@{ Dir = $dir; Weight = $weight })
+        return
+    }
+    foreach ($sd in $subdirs) {
+        Add-Jobs $sd ($depth + 1) ($recCount[$sd] ?? 0)
+    }
+}
+Add-Jobs $target 0 $total
+
+# ---- 2. DISPATCH -------------------------------------------------------------
+# Parallel robocopy /MIR from an empty temp dir onto each subtree — multi-threaded
+# deletion. Work-queue via ThrottleLimit: as each finishes, next job starts.
+$emptyDir = Join-Path ([System.IO.Path]::GetTempPath()) "ripdel-empty-$PID"
+[void](New-Item -ItemType Directory -Path $emptyDir -Force)
+
+Write-Host ("Deleting: {0}" -f $target)
+Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total.`n" -f `
+    $jobs.Count, $Parallel, $total)
+
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+$results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
+    $threads  = $using:Threads
+    $emptyDir = $using:emptyDir
+    $jobSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $out = robocopy $emptyDir $_.Dir /MIR /MT:$threads /R:1 /W:1
+    $code = $LASTEXITCODE
+    $jobSw.Stop()
+    $filesLine = ($out | Where-Object { $_ -match '^\s*Files :\s+\d' } | Select-Object -Last 1)
+    $name = Split-Path $_.Dir -Leaf
+    $info = if ($filesLine) { $filesLine.Trim() } else { "$($_.Weight) files" }
+    $status = if ($code -ge 8) { 'FAIL' } else { 'ok' }
+    Write-Host ("  [{0}] {1}  {2}  ({3:N1}s)" -f $status, $name, $info, $jobSw.Elapsed.TotalSeconds)
+    [pscustomobject]@{ Dir = $_.Dir; Code = $code; Output = $out }
+} -ThrottleLimit $Parallel
+
+# ---- 3. CLEANUP --------------------------------------------------------------
+# The parallel /MIR pass gutted the tree. Now remove the empty directory shell
+# and any stray loose files at split nodes that weren't covered by subtree jobs.
+Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $emptyDir -Force -ErrorAction SilentlyContinue
+
+# ---- 4. REPORT ---------------------------------------------------------------
+$worst = ($results | ForEach-Object Code | Measure-Object -Maximum).Maximum
+$elapsed = $sw.Elapsed.TotalSeconds
+
+# Show full output only for failed jobs
+foreach ($r in $results) {
+    if ($r.Code -ge 8) {
+        Write-Host ("`n  FAILED: {0}" -f (Split-Path $r.Dir -Leaf))
+        $r.Output | ForEach-Object { Write-Host "    $_" }
+    }
+}
+
+Write-Host ("`n{0:N1}s elapsed." -f $elapsed)
+if     ($worst -band 16) { Write-Error   "FATAL: robocopy could not run."; exit 16 }
+elseif ($worst -band 8)  { Write-Warning "Some files FAILED to delete (likely locked). See output above."; exit 1 }
+else                     { Write-Host    "Done."; exit 0 }
