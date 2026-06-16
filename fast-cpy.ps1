@@ -20,16 +20,30 @@ function Get-RelDst([string]$path) {
 # Enumerate every file ONCE, then derive per-directory metadata by walking each
 # file's ancestor chain. This replaces repeated recursive Get-ChildItem counts
 # (O(depth x N)) with a single O(N) walk + O(1) hash lookups during planning.
+#
+# DEPTH CAP: split decisions never look deeper than $MaxDepth, so we don't build
+# bookkeeping for directories below it. A file deeper than $MaxDepth still counts
+# toward its depth-$MaxDepth ancestor (keeping that subtree job's weight exact) --
+# we just skip per-directory tracking for levels that will never be split.
 $recCount    = @{}   # dir -> recursive file count (dir + all descendants)
 $directCount = @{}   # dir -> files directly in dir (non-recursive)
 $children    = @{}   # dir -> set of immediate child dirs that contain files
 
 foreach ($f in (Get-ChildItem -LiteralPath $srcFull -Recurse -File -Force -ErrorAction SilentlyContinue)) {
     $parent = [System.IO.Path]::GetDirectoryName($f.FullName)
-    $directCount[$parent] = ($directCount[$parent] ?? 0) + 1
+    $rel    = $parent.Substring($srcFull.Length).TrimStart('\')
+    $depth  = if ($rel) { $rel.Split('\').Length } else { 0 }
 
-    # Walk from the file's parent up to the source root, tallying each ancestor.
+    # A files-only job only exists at a split node (depth < MaxDepth); deeper
+    # direct counts are never read, so don't bother recording them.
+    if ($depth -lt $MaxDepth) { $directCount[$parent] = ($directCount[$parent] ?? 0) + 1 }
+
+    # Climb past any levels deeper than MaxDepth WITHOUT bookkeeping, attributing
+    # the file to its deepest splittable ancestor.
     $cur = $parent
+    while ($depth -gt $MaxDepth) { $cur = [System.IO.Path]::GetDirectoryName($cur); $depth-- }
+
+    # Tally from there up to the source root.
     while ($true) {
         $recCount[$cur] = ($recCount[$cur] ?? 0) + 1
         if ($cur.Length -le $srcFull.Length) { break }
