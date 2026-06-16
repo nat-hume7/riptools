@@ -25,7 +25,7 @@ Both commands accept these optional parameters (defaults work well for most case
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `-Parallel` | `8` | Concurrent robocopy processes |
+| `-Parallel` | `12` | Concurrent robocopy processes |
 | `-Threads` | `32` | Robocopy `/MT` threads per process |
 | `-MaxDepth` | `8` | How deep to recurse when splitting large directories |
 | `-Spread` | `3` | Job granularity — higher = more, smaller jobs |

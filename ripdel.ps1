@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory)][string] $Path,
     [switch] $Force,            # kill non-critical lockers without prompting
-    [int] $Parallel = 8,       # concurrent robocopy /MIR processes
+    [int] $Parallel = 12,       # concurrent robocopy /MIR processes
     [int] $Threads  = 32,      # robocopy /MT per process
     [int] $MaxDepth = 8,       # max depth to recurse when splitting fat directories
     [int] $Spread   = 3        # job granularity multiplier; higher = more/smaller jobs
