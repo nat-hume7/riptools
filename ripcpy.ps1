@@ -1,10 +1,10 @@
 param(
     [Parameter(Mandatory)][string] $Source,
     [Parameter(Mandatory)][string] $Target,
-    [int] $Parallel = 8,    # buckets copied simultaneously (level-1 parallelism)
-    [int] $Threads  = 32,    # robocopy /MT per job          (level-2 parallelism)
-    [int] $MaxDepth = 8,    # the maximum depth we will recurse to break up fat directories
-    [int] $Spread   = 3     # target jobs-per-bucket; higher = finer LPT balance
+    [int] $Parallel = 8,    # concurrent robocopy processes (level-1 parallelism)
+    [int] $Threads  = 32,   # robocopy /MT per process      (level-2 parallelism)
+    [int] $MaxDepth = 8,    # max depth to recurse when breaking up fat directories
+    [int] $Spread   = 3     # job granularity multiplier; higher = more/smaller jobs
 )
 $ErrorActionPreference = 'Stop'
 
@@ -95,33 +95,20 @@ function Add-Jobs([string]$dir, [int]$depth, [int]$weight) {
 }
 Add-Jobs $srcFull 0 $total
 
-# ---- 2. LPT BUCKET ASSIGNMENT ----------------------------------------------
-# Sort jobs heaviest-first; drop each into whichever bucket is currently emptiest.
-$buckets = 1..$Parallel | ForEach-Object {
-    [pscustomobject]@{ Load = 0; Jobs = [System.Collections.Generic.List[object]]::new() }
-}
-foreach ($j in ($jobs | Sort-Object Weight -Descending)) {
-    $b = $buckets | Sort-Object Load | Select-Object -First 1
-    $b.Load += $j.Weight
-    $b.Jobs.Add($j)
-}
+# ---- 2. DISPATCH ------------------------------------------------------------
+# Feed jobs (heaviest-first) into a parallel pipeline with ThrottleLimit acting
+# as a natural work queue: as each robocopy finishes, the next job starts
+# immediately. No static bucket assignment — no workers ever idle while work remains.
+Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total.`n" -f `
+    $jobs.Count, $Parallel, $total)
 
-Write-Host ("Planned {0} job(s) across {1} bucket(s) (target ~{2} files/job, {3} files total).`n" -f `
-    $jobs.Count, $Parallel, $shareTarget, $total)
-
-# ---- 3. DISPATCH ------------------------------------------------------------
-# Each bucket runs its jobs sequentially; buckets run in parallel. We CAPTURE
-# robocopy output (Out-Host has no host inside a parallel runspace and would leak
-# text into the pipeline) and emit one structured result per job.
-$results = $buckets | Where-Object { $_.Jobs.Count -gt 0 } | ForEach-Object -Parallel {
+$results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
     $threads = $using:Threads
-    foreach ($j in $_.Jobs) {
-        if ($j.Recurse) { $out = robocopy $j.Src $j.Dst /E /MT:$threads /R:1 /W:1 }
-        else            { $out = robocopy $j.Src $j.Dst    /MT:$threads /R:1 /W:1 }
-        $code = $LASTEXITCODE
-        $filesLine = ($out | Where-Object { $_ -match '^\s*Files :\s+\d' } | Select-Object -Last 1)
-        [pscustomobject]@{ Dst = $j.Dst; Code = $code; Files = $filesLine; Output = $out }
-    }
+    if ($_.Recurse) { $out = robocopy $_.Src $_.Dst /E /MT:$threads /R:1 /W:1 }
+    else            { $out = robocopy $_.Src $_.Dst    /MT:$threads /R:1 /W:1 }
+    $code = $LASTEXITCODE
+    $filesLine = ($out | Where-Object { $_ -match '^\s*Files :\s+\d' } | Select-Object -Last 1)
+    [pscustomobject]@{ Dst = $_.Dst; Code = $code; Files = $filesLine; Output = $out }
 } -ThrottleLimit $Parallel
 
 # Robocopy exit codes: <8 = success (1=copied, 2=extras, 3=both...); 8=failures, 16=fatal.
