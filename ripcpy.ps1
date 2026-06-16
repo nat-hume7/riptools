@@ -119,7 +119,8 @@ $maxRelLen = ($jobs | ForEach-Object {
 $colW = [math]::Max($maxRelLen, 4)
 
 Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total." -f $jobs.Count, $Parallel, $total)
-Write-Host ("        {0,-$colW}  {1,5} {2,7} {3,8} {4,9} {5,7} {6,7}" -f 'Path','Total','Copied','Skipped','Mismatch','FAILED','Extras')
+$hdr = ('Total','Copied','Skipped','Mismatch','FAILED','Extras' | ForEach-Object { $_.PadLeft(9) }) -join ''
+Write-Host ("        {0,-$colW}  {1}" -f 'Path', $hdr)
 Write-Host ""
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -137,7 +138,7 @@ $results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
     $rel = if ($_.Dst.Length -gt $pfx.Length) { $_.Dst.Substring($pfx.Length + 1) } else { '.' }
     $status = if ($code -ge 8) { 'FAIL' } else { 'ok' }
     if ($filesLine -match '^\s*Files :\s+(.+)$') {
-        $nums = ($Matches[1].Trim() -split '\s+' | ForEach-Object { $_.PadLeft(7) }) -join ''
+        $nums = ($Matches[1].Trim() -split '\s+' | ForEach-Object { $_.PadLeft(9) }) -join ''
     } else { $nums = "$($_.Weight) files" }
     Write-Host ("  [{0}] {1,-$cw}  {2}  ({3:N1}s)" -f $status, $rel, $nums, $jobSw.Elapsed.TotalSeconds)
     [pscustomobject]@{ Dst = $_.Dst; Code = $code; Files = $filesLine; Output = $out }

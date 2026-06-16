@@ -328,7 +328,8 @@ try {
 
     Write-Host ("Deleting: {0}" -f $target)
     Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total." -f $jobs.Count, $Parallel, $total)
-    Write-Host ("        {0,-$colW}  {1,5} {2,7} {3,8} {4,9} {5,7} {6,7}" -f 'Path','Total','Copied','Skipped','Mismatch','FAILED','Extras')
+    $hdr = ('Total','Copied','Skipped','Mismatch','FAILED','Extras' | ForEach-Object { $_.PadLeft(9) }) -join ''
+    Write-Host ("        {0,-$colW}  {1}" -f 'Path', $hdr)
     Write-Host ""
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -345,7 +346,7 @@ try {
         $rel = if ($_.Dir.Length -gt $pfx.Length) { $_.Dir.Substring($pfx.Length + 1) } else { '.' }
         $status = if ($code -ge 8) { 'FAIL' } else { 'ok' }
         if ($filesLine -match '^\s*Files :\s+(.+)$') {
-            $nums = ($Matches[1].Trim() -split '\s+' | ForEach-Object { $_.PadLeft(7) }) -join ''
+            $nums = ($Matches[1].Trim() -split '\s+' | ForEach-Object { $_.PadLeft(9) }) -join ''
         } else { $nums = "$($_.Weight) files" }
         Write-Host ("  [{0}] {1,-$cw}  {2}  ({3:N1}s)" -f $status, $rel, $nums, $jobSw.Elapsed.TotalSeconds)
         [pscustomobject]@{ Dir = $_.Dir; Code = $code; Output = $out }
