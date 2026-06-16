@@ -171,8 +171,8 @@ function Get-Lockers([string]$targetPath, [string[]]$filePaths) {
     $lockers
 }
 
-# ---- KILL & RETRY HELPER ----------------------------------------------------
-function Invoke-KillAndRetry([object[]]$lockers, [scriptblock]$retryAction) {
+# ---- KILL HELPER -------------------------------------------------------------
+function Invoke-Kill([object[]]$lockers) {
     $critical = @($lockers | Where-Object Critical)
     $killable = @($lockers | Where-Object { -not $_.Critical })
 
@@ -205,7 +205,6 @@ function Invoke-KillAndRetry([object[]]$lockers, [scriptblock]$retryAction) {
         }
     }
     Start-Sleep -Milliseconds 500
-    & $retryAction
     return $true
 }
 
@@ -229,9 +228,8 @@ if (-not $item.PSIsContainer) {
     catch {
         Write-Host ("  Cannot delete: {0}" -f $item.Name)
         $lockers = Get-Lockers $item.FullName -filePaths @($item.FullName)
-        if ($lockers.Count -gt 0) {
-            Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue } | Out-Null
-        }
+        if ($lockers.Count -gt 0) { Invoke-Kill $lockers | Out-Null }
+        Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $item.FullName) { Write-Error "Could not delete: $($item.FullName)"; exit 1 }
     }
     Write-Host "Done."; exit 0
@@ -331,51 +329,24 @@ try {
         [pscustomobject]@{ Dir = $_.Dir; Code = $code; Output = $out }
     } -ThrottleLimit $Parallel
 
-    # ===
-    # =======
-    # =========================
-    # ============================================================================================
-    # ---- 3. HANDLE LOCKED FILES --------------------------------------------------
+    # ---- 3. CLEANUP & LOCK RESOLUTION -------------------------------------------
+    # Single retry loop: attempt removal, identify blockers, kill, repeat.
+    $maxRetries = 2
+    for ($attempt = 0; $attempt -lt $maxRetries; $attempt++) {
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $target)) { break }
 
-    # Glean failedPaths from robocopy output
-    $failedPaths = [System.Collections.Generic.List[string]]::new()
-    foreach ($r in $results) {
-        if ($r.Code -ge 8) {
-            foreach ($line in $r.Output) {
-                if ($line -match 'ERROR.*(?:Deleting|Copying)\s+(?:File|Dir)\s+(.+)$') {
-                    $failedPaths.Add($Matches[1].Trim())
-                }
-            }
-        }
+        # Something still blocking — find remaining files and identify lockers
+        $remaining = @(Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue)
+        $filePaths = if ($remaining.Count -gt 0) { @($remaining.FullName) } else { $null }
+        $lockers = Get-Lockers $target -filePaths $filePaths
+
+        if ($lockers.Count -eq 0) { break }  # can't identify blockers, give up
+        $killed = Invoke-Kill $lockers
+        if (-not $killed) { break }  # user declined, stop
     }
 
-    # If any paths failed, Get-Lockers and Invoke-KillAndRetry, we loop until no more lockers are found or all failed paths are gone.
-    # We only check lockers against the failed paths, not the entire target, to minimize noise and redundant retries.
-    if ($failedPaths.Count -gt 0) {
-        $stillExist = @($failedPaths | Where-Object { Test-Path -LiteralPath $_ })
-        if ($stillExist.Count -gt 0) {
-            Write-Host ("`n  {0} path(s) could not be deleted." -f $stillExist.Count)
-            $lockers = Get-Lockers $target -filePaths $stillExist
-            if ($lockers.Count -gt 0) {
-                Invoke-KillAndRetry $lockers {
-                    foreach ($f in $stillExist) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-                } | Out-Null
-            }
-        }
-    }
-
-    # ---- 4. FINAL CLEANUP --------------------------------------------------------
-    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
-
-    # If still locked, one more attempt with handle.exe
-    if (Test-Path -LiteralPath $target) {
-        $lockers = Get-Lockers $target
-        if ($lockers.Count -gt 0) {
-            Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue } | Out-Null
-        }
-    }
-
-    # ---- 5. REPORT ---------------------------------------------------------------
+    # ---- 4. REPORT ---------------------------------------------------------------
     $elapsed = $sw.Elapsed.TotalSeconds
     Write-Host ("`n{0:N1}s elapsed." -f $elapsed)
     if (Test-Path -LiteralPath $target) { Write-Warning "Directory could not be fully removed."; exit 1 }
