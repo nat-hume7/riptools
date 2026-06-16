@@ -102,6 +102,8 @@ Add-Jobs $srcFull 0 $total
 Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total.`n" -f `
     $jobs.Count, $Parallel, $total)
 
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+
 $results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
     $threads = $using:Threads
     if ($_.Recurse) { $out = robocopy $_.Src $_.Dst /E /MT:$threads /R:1 /W:1 }
@@ -119,7 +121,8 @@ foreach ($r in $results) {
 }
 
 $worst = ($results | ForEach-Object Code | Measure-Object -Maximum).Maximum
-Write-Host ""
-if     ($worst -band 16) { Write-Error   "FATAL: robocopy could not run." }
-elseif ($worst -band 8)  { Write-Warning "Some files FAILED to copy. See per-job output above." }
-else                     { Write-Host    "Done." }
+$elapsed = $sw.Elapsed.TotalSeconds
+Write-Host ("{0:N1}s elapsed.`n" -f $elapsed)
+if     ($worst -band 16) { Write-Error   "FATAL: robocopy could not run."; exit 16 }
+elseif ($worst -band 8)  { Write-Warning "Some files FAILED to copy. See per-job output above."; exit 1 }
+else                     { Write-Host    "Done."; exit 0 }
