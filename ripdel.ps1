@@ -320,24 +320,34 @@ $emptyDir = Join-Path ([System.IO.Path]::GetTempPath()) "ripdel-empty-$PID"
 [void](New-Item -ItemType Directory -Path $emptyDir -Force)
 
 try {
+    $pathPrefix = $target
+    $maxRelLen = ($jobs | ForEach-Object {
+        if ($_.Dir.Length -gt $pathPrefix.Length) { $_.Dir.Length - $pathPrefix.Length - 1 } else { 1 }
+    } | Measure-Object -Maximum).Maximum
+    $colW = [math]::Max($maxRelLen, 4)
+
     Write-Host ("Deleting: {0}" -f $target)
     Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total." -f $jobs.Count, $Parallel, $total)
-    Write-Host ("        {0,-20} {1}" -f 'Name', 'Total  Copied  Skipped  Mismatch  FAILED  Extras')
+    Write-Host ("        {0,-$colW}  {1,5} {2,7} {3,8} {4,9} {5,7} {6,7}" -f 'Path','Total','Copied','Skipped','Mismatch','FAILED','Extras')
     Write-Host ""
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     $results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
         $threads  = $using:Threads
         $emptyDir = $using:emptyDir
+        $pfx      = $using:pathPrefix
+        $cw       = $using:colW
         $jobSw = [System.Diagnostics.Stopwatch]::StartNew()
         $out = robocopy $emptyDir $_.Dir /MIR /MT:$threads /R:1 /W:1
         $code = $LASTEXITCODE
         $jobSw.Stop()
         $filesLine = ($out | Where-Object { $_ -match '^\s*Files :\s+\d' } | Select-Object -Last 1)
-        $name = Split-Path $_.Dir -Leaf
-        $info = if ($filesLine) { $filesLine.Trim() } else { "$($_.Weight) files" }
+        $rel = if ($_.Dir.Length -gt $pfx.Length) { $_.Dir.Substring($pfx.Length + 1) } else { '.' }
         $status = if ($code -ge 8) { 'FAIL' } else { 'ok' }
-        Write-Host ("  [{0}] {1,-20} {2}  ({3:N1}s)" -f $status, $name, $info, $jobSw.Elapsed.TotalSeconds)
+        if ($filesLine -match '^\s*Files :\s+(.+)$') {
+            $nums = ($Matches[1].Trim() -split '\s+' | ForEach-Object { $_.PadLeft(7) }) -join ''
+        } else { $nums = "$($_.Weight) files" }
+        Write-Host ("  [{0}] {1,-$cw}  {2}  ({3:N1}s)" -f $status, $rel, $nums, $jobSw.Elapsed.TotalSeconds)
         [pscustomobject]@{ Dir = $_.Dir; Code = $code; Output = $out }
     } -ThrottleLimit $Parallel
 

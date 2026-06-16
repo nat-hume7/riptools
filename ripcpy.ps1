@@ -111,25 +111,35 @@ Add-Jobs $srcFull 0 $total
 # Feed jobs (heaviest-first) into a parallel pipeline with ThrottleLimit acting
 # as a natural work queue: as each robocopy finishes, the next job starts
 # immediately. No static bucket assignment — no workers ever idle while work remains.
-Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total." -f `
-    $jobs.Count, $Parallel, $total)
-Write-Host ("        {0,-20} {1}" -f 'Name', 'Total  Copied  Skipped  Mismatch  FAILED  Extras')
+$targetFull = (Resolve-Path $Target -ErrorAction SilentlyContinue)?.Path ?? $Target
+$pathPrefix = $targetFull.TrimEnd('\')
+$maxRelLen = ($jobs | ForEach-Object {
+    if ($_.Dst.Length -gt $pathPrefix.Length) { $_.Dst.Length - $pathPrefix.Length - 1 } else { 1 }
+} | Measure-Object -Maximum).Maximum
+$colW = [math]::Max($maxRelLen, 4)
+
+Write-Host ("Dispatching {0} job(s), {1} concurrent runners, {2} files total." -f $jobs.Count, $Parallel, $total)
+Write-Host ("        {0,-$colW}  {1,5} {2,7} {3,8} {4,9} {5,7} {6,7}" -f 'Path','Total','Copied','Skipped','Mismatch','FAILED','Extras')
 Write-Host ""
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 $results = $jobs | Sort-Object Weight -Descending | ForEach-Object -Parallel {
-    $threads = $using:Threads
+    $threads   = $using:Threads
+    $pfx       = $using:pathPrefix
+    $cw        = $using:colW
     $jobSw = [System.Diagnostics.Stopwatch]::StartNew()
     if ($_.Recurse) { $out = robocopy $_.Src $_.Dst /E /MT:$threads /R:1 /W:1 }
     else            { $out = robocopy $_.Src $_.Dst    /MT:$threads /R:1 /W:1 }
     $code = $LASTEXITCODE
     $jobSw.Stop()
     $filesLine = ($out | Where-Object { $_ -match '^\s*Files :\s+\d' } | Select-Object -Last 1)
-    $name = Split-Path $_.Dst -Leaf
-    $info = if ($filesLine) { $filesLine.Trim() } else { "$($_.Weight) files" }
+    $rel = if ($_.Dst.Length -gt $pfx.Length) { $_.Dst.Substring($pfx.Length + 1) } else { '.' }
     $status = if ($code -ge 8) { 'FAIL' } else { 'ok' }
-    Write-Host ("  [{0}] {1,-20} {2}  ({3:N1}s)" -f $status, $name, $info, $jobSw.Elapsed.TotalSeconds)
+    if ($filesLine -match '^\s*Files :\s+(.+)$') {
+        $nums = ($Matches[1].Trim() -split '\s+' | ForEach-Object { $_.PadLeft(7) }) -join ''
+    } else { $nums = "$($_.Weight) files" }
+    Write-Host ("  [{0}] {1,-$cw}  {2}  ({3:N1}s)" -f $status, $rel, $nums, $jobSw.Elapsed.TotalSeconds)
     [pscustomobject]@{ Dst = $_.Dst; Code = $code; Files = $filesLine; Output = $out }
 } -ThrottleLimit $Parallel
 
