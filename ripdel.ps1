@@ -10,6 +10,10 @@ $ErrorActionPreference = 'Stop'
 
 $item = Get-Item -LiteralPath $Path
 
+# ===
+# =======
+# =========================
+# ============================================================================================
 # ---- LOCKER DETECTION --------------------------------------------------------
 # Three-tier approach:
 #   1. PEB CurrentDirectory scan — finds processes cd'd into the target (instant, most common)
@@ -98,6 +102,11 @@ if (-not (Test-Path $handleExe)) {
     $handleExe = (Get-Command handle.exe -ErrorAction SilentlyContinue)?.Source
     if (-not $handleExe) { $handleExe = (Get-Command handle64.exe -ErrorAction SilentlyContinue)?.Source }
 }
+
+# They're always used together
+# Separated because there's a conditional between them — we only invoke kill+retry if lockers were actually found ($lockers.Count -gt 0).
+#     $lockers = Get-Lockers $path          # who?
+#     Invoke-KillAndRetry $lockers { ... }  # kill + retry
 
 function Get-Lockers([string]$targetPath, [string[]]$filePaths) {
     $targetNorm = $targetPath.TrimEnd('\')
@@ -200,6 +209,20 @@ function Invoke-KillAndRetry([object[]]$lockers, [scriptblock]$retryAction) {
     return $true
 }
 
+# =
+# ==
+# ===
+# ======
+# ==========
+# ================
+# ========================
+# ========================================
+# =================================================================
+# ============================================================================================
+# DIRECTORY DELETION
+# ============================================================================================
+$target = $item.FullName.TrimEnd('\')
+
 # ---- SINGLE FILE FAST PATH ---------------------------------------------------
 if (-not $item.PSIsContainer) {
     try { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop }
@@ -214,15 +237,16 @@ if (-not $item.PSIsContainer) {
     Write-Host "Done."; exit 0
 }
 
-# ==============================================================================
-# DIRECTORY DELETION
-# ==============================================================================
-$target = $item.FullName.TrimEnd('\')
-
+# ===
+# =======
+# =========================
+# ============================================================================================
 # ---- 0. SCAN -----------------------------------------------------------------
-$recCount    = @{}
-$directCount = @{}
-$children    = @{}
+# Walk the target tree down to $MaxDepth building per-directory file counts.
+# At MaxDepth, bulk-count via .NET enumeration (no per-file PowerShell overhead).
+$recCount    = @{}   # dir -> recursive file count
+$directCount = @{}   # dir -> files directly in dir
+$children    = @{}   # dir -> set of immediate child dirs containing files
 $bulkEnumOpts = [System.IO.EnumerationOptions]@{ RecurseSubdirectories = $true; IgnoreInaccessible = $true }
 
 function Scan-Dir([string]$dir, [int]$depth) {
@@ -257,21 +281,15 @@ function Scan-Dir([string]$dir, [int]$depth) {
 }
 Scan-Dir $target 0
 
-# ---- EMPTY DIRECTORY CASE ----------------------------------------------------
 $total = $recCount[$target] ?? 0
-if ($total -eq 0) {
-    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
-    if (-not (Test-Path -LiteralPath $target)) { Write-Host "Removed."; exit 0 }
-    Write-Host "Directory locked — identifying lockers..."
-    $lockers = Get-Lockers $target
-    if ($lockers.Count -gt 0) {
-        Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue } | Out-Null
-    }
-    if (-not (Test-Path -LiteralPath $target)) { Write-Host "Removed."; exit 0 }
-    Write-Warning "Could not remove (held open by another process): $target"; exit 1
-}
 
+# ===
+# =======
+# =========================
+# ============================================================================================
 # ---- 1. SPLIT ----------------------------------------------------------------
+# Break fat directories into subtree jobs. Unlike ripcpy, we only emit subtree
+# jobs (no files-only) — stray loose files at split nodes are cleaned up after.
 $shareTarget = [math]::Max(1, [math]::Ceiling($total / ($Parallel * $Spread)))
 $jobs = [System.Collections.Generic.List[object]]::new()
 
@@ -285,6 +303,10 @@ function Add-Jobs([string]$dir, [int]$depth, [int]$weight) {
 }
 Add-Jobs $target 0 $total
 
+# ===
+# =======
+# =========================
+# ============================================================================================
 # ---- 2. DISPATCH -------------------------------------------------------------
 $emptyDir = Join-Path ([System.IO.Path]::GetTempPath()) "ripdel-empty-$PID"
 [void](New-Item -ItemType Directory -Path $emptyDir -Force)
@@ -309,7 +331,13 @@ try {
         [pscustomobject]@{ Dir = $_.Dir; Code = $code; Output = $out }
     } -ThrottleLimit $Parallel
 
+    # ===
+    # =======
+    # =========================
+    # ============================================================================================
     # ---- 3. HANDLE LOCKED FILES --------------------------------------------------
+
+    # Glean failedPaths from robocopy output
     $failedPaths = [System.Collections.Generic.List[string]]::new()
     foreach ($r in $results) {
         if ($r.Code -ge 8) {
@@ -321,6 +349,8 @@ try {
         }
     }
 
+    # If any paths failed, Get-Lockers and Invoke-KillAndRetry, we loop until no more lockers are found or all failed paths are gone.
+    # We only check lockers against the failed paths, not the entire target, to minimize noise and redundant retries.
     if ($failedPaths.Count -gt 0) {
         $stillExist = @($failedPaths | Where-Object { Test-Path -LiteralPath $_ })
         if ($stillExist.Count -gt 0) {
