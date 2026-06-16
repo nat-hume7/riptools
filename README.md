@@ -1,6 +1,9 @@
 # Riptools
 Dead-simple commands that rip through bulk file operations on Windows. **Requires PowerShell 7+** and Windows OS. 
 
+**Please install Poweshell 7 for these scripts to work. They will not work in standard Powershell 5.1**
+https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows?view=powershell-7.6
+
 Dramatically faster than File Explorer, and still quite notably faster than `Remove-Item`, or standard multi-threaded `robocopy` for many operations. Particularly powerful for copy/delete operations involving many small loose files. 
 
 <br>
