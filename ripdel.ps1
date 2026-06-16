@@ -11,13 +11,13 @@ $ErrorActionPreference = 'Stop'
 $item = Get-Item -LiteralPath $Path
 
 # ---- LOCKER DETECTION --------------------------------------------------------
-# Two complementary methods:
-#   1. PEB CurrentDirectory scan — finds processes cd'd into the target (most common)
-#   2. handle.exe — finds processes with open file/directory handles (rarer)
+# Three-tier approach:
+#   1. PEB CurrentDirectory scan — finds processes cd'd into the target (instant, most common)
+#   2. Restart Manager API — finds processes with files open (instant, file-level only)
+#   3. handle.exe — finds any remaining open handles (slow fallback, catches everything)
 
 Add-Type -TypeDefinition @'
 using System;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -41,10 +41,6 @@ public static class CwdScanner {
         public IntPtr InheritedFromUniqueProcessId;
     }
 
-    /// <summary>
-    /// Reads the CurrentDirectory DosPath from a process's PEB.
-    /// Returns null if access denied or read fails.
-    /// </summary>
     public static string GetProcessCwd(int pid) {
         IntPtr hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
         if (hProc == IntPtr.Zero) return null;
@@ -53,32 +49,47 @@ public static class CwdScanner {
             int retLen;
             if (NtQueryInformationProcess(hProc, ProcessBasicInformation, ref pbi, Marshal.SizeOf(pbi), out retLen) != 0)
                 return null;
-
-            // Read ProcessParameters pointer from PEB (offset 0x20 on x64)
             byte[] buf8 = new byte[8];
             int read;
-            IntPtr paramsPtr = IntPtr.Add(pbi.PebBaseAddress, 0x20);
-            if (!ReadProcessMemory(hProc, paramsPtr, buf8, 8, out read)) return null;
+            if (!ReadProcessMemory(hProc, IntPtr.Add(pbi.PebBaseAddress, 0x20), buf8, 8, out read)) return null;
             IntPtr processParams = (IntPtr)BitConverter.ToInt64(buf8, 0);
-
-            // CurrentDirectory.DosPath is a UNICODE_STRING at offset 0x38 in RTL_USER_PROCESS_PARAMETERS (x64)
-            // UNICODE_STRING: ushort Length, ushort MaxLength, padding, IntPtr Buffer
             byte[] uniStr = new byte[16];
-            IntPtr cwdPtr = IntPtr.Add(processParams, 0x38);
-            if (!ReadProcessMemory(hProc, cwdPtr, uniStr, 16, out read)) return null;
-
+            if (!ReadProcessMemory(hProc, IntPtr.Add(processParams, 0x38), uniStr, 16, out read)) return null;
             ushort length = BitConverter.ToUInt16(uniStr, 0);
             IntPtr strBuffer = (IntPtr)BitConverter.ToInt64(uniStr, 8);
             if (length == 0 || strBuffer == IntPtr.Zero) return null;
-
             byte[] strBytes = new byte[length];
             if (!ReadProcessMemory(hProc, strBuffer, strBytes, length, out read)) return null;
-
             return Encoding.Unicode.GetString(strBytes).TrimEnd('\\');
-        } finally {
-            CloseHandle(hProc);
-        }
+        } finally { CloseHandle(hProc); }
     }
+}
+'@ -ErrorAction SilentlyContinue
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public struct RM_UNIQUE_PROCESS {
+    public int dwProcessId;
+    public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+}
+public enum RM_APP_TYPE { RmUnknownApp = 0, RmMainWindow = 1, RmOtherWindow = 2, RmService = 3, RmExplorer = 4, RmConsole = 5, RmCritical = 1000 }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct RM_PROCESS_INFO {
+    public RM_UNIQUE_PROCESS Process;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]  public string strServiceShortName;
+    public RM_APP_TYPE ApplicationType;
+    public int AppStatus;
+    public int TSSessionId;
+    [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+}
+public static class RestartManager {
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] public static extern int RmStartSession(out int h, int flags, string key);
+    [DllImport("rstrtmgr.dll")]                            public static extern int RmEndSession(int h);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] public static extern int RmRegisterResources(int h, int nFiles, string[] files, int nApps, RM_UNIQUE_PROCESS[] apps, int nSvc, string[] svcs);
+    [DllImport("rstrtmgr.dll")]                            public static extern int RmGetList(int h, out int needed, ref int count, [In, Out] RM_PROCESS_INFO[] procs, out int reboot);
 }
 '@ -ErrorAction SilentlyContinue
 
@@ -88,30 +99,53 @@ if (-not (Test-Path $handleExe)) {
     if (-not $handleExe) { $handleExe = (Get-Command handle64.exe -ErrorAction SilentlyContinue)?.Source }
 }
 
-function Get-Lockers([string]$targetPath) {
+function Get-Lockers([string]$targetPath, [string[]]$filePaths) {
     $targetNorm = $targetPath.TrimEnd('\')
     $lockers = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[int]]::new()
     $myPid = $PID
+    $isCritical = { param($name) $name -in @('System','csrss','smss','wininit','services','lsass') }
 
-    # Method 1: PEB CurrentDirectory scan (finds CWD locks)
+    # ---- Tier 1: PEB CurrentDirectory scan (instant) ----
     foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
         if ($proc.Id -eq $myPid -or $proc.Id -le 4) { continue }
         try {
             $cwd = [CwdScanner]::GetProcessCwd($proc.Id)
             if ($cwd -and ($cwd -eq $targetNorm -or $cwd.StartsWith("$targetNorm\", [System.StringComparison]::OrdinalIgnoreCase))) {
                 [void]$seen.Add($proc.Id)
-                $lockers.Add([pscustomobject]@{
-                    PID      = $proc.Id
-                    Name     = $proc.ProcessName
-                    Source   = 'CWD'
-                    Critical = ($proc.ProcessName -in @('System','csrss','smss','wininit','services','lsass'))
-                })
+                $lockers.Add([pscustomobject]@{ PID = $proc.Id; Name = $proc.ProcessName; Source = 'CWD'; Critical = (& $isCritical $proc.ProcessName) })
             }
         } catch { }
     }
 
-    # Method 2: handle.exe (finds open file/directory handles) — skip if CWD scan already found lockers
+    # ---- Tier 2: Restart Manager (instant, file-level only) ----
+    if ($filePaths -and $filePaths.Count -gt 0) {
+        for ($batch = 0; $batch -lt $filePaths.Length; $batch += 128) {
+            $chunk = $filePaths[$batch..[math]::Min($batch + 127, $filePaths.Length - 1)]
+            $handle = 0
+            if ([RestartManager]::RmStartSession([ref]$handle, 0, [guid]::NewGuid().ToString()) -ne 0) { continue }
+            try {
+                if ([RestartManager]::RmRegisterResources($handle, $chunk.Length, $chunk, 0, $null, 0, $null) -ne 0) { continue }
+                $needed = 0; $count = 0; $reboot = 0
+                [RestartManager]::RmGetList($handle, [ref]$needed, [ref]$count, $null, [ref]$reboot) | Out-Null
+                if ($needed -eq 0) { continue }
+                $count = $needed
+                $procs = [RM_PROCESS_INFO[]]::new($count)
+                if ([RestartManager]::RmGetList($handle, [ref]$needed, [ref]$count, $procs, [ref]$reboot) -ne 0) { continue }
+                for ($i = 0; $i -lt $count; $i++) {
+                    $p = $procs[$i]
+                    if ($p.Process.dwProcessId -eq $myPid -or $seen.Contains($p.Process.dwProcessId)) { continue }
+                    [void]$seen.Add($p.Process.dwProcessId)
+                    $lockers.Add([pscustomobject]@{
+                        PID = $p.Process.dwProcessId; Name = $p.strAppName; Source = 'File'
+                        Critical = ($p.ApplicationType -eq [RM_APP_TYPE]::RmCritical)
+                    })
+                }
+            } finally { [RestartManager]::RmEndSession($handle) | Out-Null }
+        }
+    }
+
+    # ---- Tier 3: handle.exe (slow fallback — only if tiers 1+2 found nothing) ----
     if ($handleExe -and $lockers.Count -eq 0) {
         $out = & $handleExe -a -u -accepteula $targetPath 2>&1 | Where-Object { $_ -is [string] }
         foreach ($line in $out) {
@@ -120,12 +154,7 @@ function Get-Lockers([string]$targetPath) {
                 if ($pid -eq $myPid -or $seen.Contains($pid)) { continue }
                 [void]$seen.Add($pid)
                 $procName = $Matches[1].Trim()
-                $lockers.Add([pscustomobject]@{
-                    PID      = $pid
-                    Name     = $procName
-                    Source   = 'Handle'
-                    Critical = ($procName -in @('System','csrss','smss','wininit','services','lsass'))
-                })
+                $lockers.Add([pscustomobject]@{ PID = $pid; Name = $procName; Source = 'Handle'; Critical = (& $isCritical $procName) })
             }
         }
     }
@@ -176,7 +205,7 @@ if (-not $item.PSIsContainer) {
     try { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop }
     catch {
         Write-Host ("  Cannot delete: {0}" -f $item.Name)
-        $lockers = Get-Lockers $item.FullName
+        $lockers = Get-Lockers $item.FullName -filePaths @($item.FullName)
         if ($lockers.Count -gt 0) {
             Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue } | Out-Null
         }
@@ -296,7 +325,7 @@ try {
         $stillExist = @($failedPaths | Where-Object { Test-Path -LiteralPath $_ })
         if ($stillExist.Count -gt 0) {
             Write-Host ("`n  {0} path(s) could not be deleted." -f $stillExist.Count)
-            $lockers = Get-Lockers $target
+            $lockers = Get-Lockers $target -filePaths $stillExist
             if ($lockers.Count -gt 0) {
                 Invoke-KillAndRetry $lockers {
                     foreach ($f in $stillExist) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
