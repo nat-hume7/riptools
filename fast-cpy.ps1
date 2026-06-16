@@ -31,8 +31,12 @@ $children    = @{}   # dir -> set of immediate child dirs that contain files
 
 foreach ($f in (Get-ChildItem -LiteralPath $srcFull -Recurse -File -Force -ErrorAction SilentlyContinue)) {
     $parent = [System.IO.Path]::GetDirectoryName($f.FullName)
-    $rel    = $parent.Substring($srcFull.Length).TrimStart('\')
-    $depth  = if ($rel) { $rel.Split('\').Length } else { 0 }
+    # Depth = number of '\' separators between the source root and $parent.
+    # Counted in-place (no Split allocation) since this runs once per file.
+    $depth = 0
+    for ($i = $srcFull.Length; $i -lt $parent.Length; $i++) {
+        if ($parent[$i] -eq '\') { $depth++ }
+    }
 
     # A files-only job only exists at a split node (depth < MaxDepth); deeper
     # direct counts are never read, so don't bother recording them.
