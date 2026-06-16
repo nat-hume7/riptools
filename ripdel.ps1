@@ -10,38 +10,126 @@ $ErrorActionPreference = 'Stop'
 
 $item = Get-Item -LiteralPath $Path
 
-# ---- HANDLE.EXE RESOLUTION --------------------------------------------------
+# ---- LOCKER DETECTION --------------------------------------------------------
+# Two complementary methods:
+#   1. PEB CurrentDirectory scan — finds processes cd'd into the target (most common)
+#   2. handle.exe — finds processes with open file/directory handles (rarer)
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class CwdScanner {
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("ntdll.dll")]    static extern int NtQueryInformationProcess(IntPtr h, int cls, ref PROCESS_BASIC_INFORMATION info, int size, out int retLen);
+    [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr proc, IntPtr baseAddr, byte[] buffer, int size, out int read);
+
+    const int ProcessBasicInformation = 0;
+    const int PROCESS_QUERY_INFORMATION = 0x0400;
+    const int PROCESS_VM_READ = 0x0010;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_BASIC_INFORMATION {
+        public IntPtr ExitStatus;
+        public IntPtr PebBaseAddress;
+        public IntPtr AffinityMask;
+        public IntPtr BasePriority;
+        public IntPtr UniqueProcessId;
+        public IntPtr InheritedFromUniqueProcessId;
+    }
+
+    /// <summary>
+    /// Reads the CurrentDirectory DosPath from a process's PEB.
+    /// Returns null if access denied or read fails.
+    /// </summary>
+    public static string GetProcessCwd(int pid) {
+        IntPtr hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
+        if (hProc == IntPtr.Zero) return null;
+        try {
+            var pbi = new PROCESS_BASIC_INFORMATION();
+            int retLen;
+            if (NtQueryInformationProcess(hProc, ProcessBasicInformation, ref pbi, Marshal.SizeOf(pbi), out retLen) != 0)
+                return null;
+
+            // Read ProcessParameters pointer from PEB (offset 0x20 on x64)
+            byte[] buf8 = new byte[8];
+            int read;
+            IntPtr paramsPtr = IntPtr.Add(pbi.PebBaseAddress, 0x20);
+            if (!ReadProcessMemory(hProc, paramsPtr, buf8, 8, out read)) return null;
+            IntPtr processParams = (IntPtr)BitConverter.ToInt64(buf8, 0);
+
+            // CurrentDirectory.DosPath is a UNICODE_STRING at offset 0x38 in RTL_USER_PROCESS_PARAMETERS (x64)
+            // UNICODE_STRING: ushort Length, ushort MaxLength, padding, IntPtr Buffer
+            byte[] uniStr = new byte[16];
+            IntPtr cwdPtr = IntPtr.Add(processParams, 0x38);
+            if (!ReadProcessMemory(hProc, cwdPtr, uniStr, 16, out read)) return null;
+
+            ushort length = BitConverter.ToUInt16(uniStr, 0);
+            IntPtr strBuffer = (IntPtr)BitConverter.ToInt64(uniStr, 8);
+            if (length == 0 || strBuffer == IntPtr.Zero) return null;
+
+            byte[] strBytes = new byte[length];
+            if (!ReadProcessMemory(hProc, strBuffer, strBytes, length, out read)) return null;
+
+            return Encoding.Unicode.GetString(strBytes).TrimEnd('\\');
+        } finally {
+            CloseHandle(hProc);
+        }
+    }
+}
+'@ -ErrorAction SilentlyContinue
+
 $handleExe = Join-Path $PSScriptRoot 'handle.exe'
 if (-not (Test-Path $handleExe)) {
     $handleExe = (Get-Command handle.exe -ErrorAction SilentlyContinue)?.Source
     if (-not $handleExe) { $handleExe = (Get-Command handle64.exe -ErrorAction SilentlyContinue)?.Source }
 }
-if (-not $handleExe) {
-    Write-Warning "handle.exe not found. Run install.ps1 or download from https://live.sysinternals.com/handle64.exe"
-    Write-Warning "Locked-file identification will be unavailable."
-}
 
-# ---- FIND LOCKERS (via handle.exe) ------------------------------------------
 function Get-Lockers([string]$targetPath) {
-    if (-not $handleExe) { return @() }
-    $out = & $handleExe -a -u -accepteula $targetPath 2>&1 | Where-Object { $_ -is [string] }
-    # Output format: "processname pid: PID type (access): handle: path"
-    # Example: "Code.exe           pid: 12340  type: File  7C4: C:\git\..."
+    $targetNorm = $targetPath.TrimEnd('\')
     $lockers = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($line in $out) {
-        if ($line -match '^(.+?)\s+pid:\s*(\d+)\s+type:\s*(\w+)') {
-            $pid = [int]$Matches[2]
-            if ($pid -eq $PID -or $seen.Contains($pid)) { continue }
-            [void]$seen.Add($pid)
-            $procName = $Matches[1].Trim()
-            $lockers.Add([pscustomobject]@{
-                PID      = $pid
-                Name     = $procName
-                Critical = ($procName -in @('System','csrss','smss','wininit','services','lsass'))
-            })
+    $myPid = $PID
+
+    # Method 1: PEB CurrentDirectory scan (finds CWD locks)
+    foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
+        if ($proc.Id -eq $myPid -or $proc.Id -le 4) { continue }
+        try {
+            $cwd = [CwdScanner]::GetProcessCwd($proc.Id)
+            if ($cwd -and ($cwd -eq $targetNorm -or $cwd.StartsWith("$targetNorm\", [System.StringComparison]::OrdinalIgnoreCase))) {
+                [void]$seen.Add($proc.Id)
+                $lockers.Add([pscustomobject]@{
+                    PID      = $proc.Id
+                    Name     = $proc.ProcessName
+                    Source   = 'CWD'
+                    Critical = ($proc.ProcessName -in @('System','csrss','smss','wininit','services','lsass'))
+                })
+            }
+        } catch { }
+    }
+
+    # Method 2: handle.exe (finds open file/directory handles) — skip if CWD scan already found lockers
+    if ($handleExe -and $lockers.Count -eq 0) {
+        $out = & $handleExe -a -u -accepteula $targetPath 2>&1 | Where-Object { $_ -is [string] }
+        foreach ($line in $out) {
+            if ($line -match '^(.+?)\s+pid:\s*(\d+)\s+type:\s*(\w+)') {
+                $pid = [int]$Matches[2]
+                if ($pid -eq $myPid -or $seen.Contains($pid)) { continue }
+                [void]$seen.Add($pid)
+                $procName = $Matches[1].Trim()
+                $lockers.Add([pscustomobject]@{
+                    PID      = $pid
+                    Name     = $procName
+                    Source   = 'Handle'
+                    Critical = ($procName -in @('System','csrss','smss','wininit','services','lsass'))
+                })
+            }
         }
     }
+
     $lockers
 }
 
@@ -52,7 +140,7 @@ function Invoke-KillAndRetry([object[]]$lockers, [scriptblock]$retryAction) {
 
     Write-Host "`n  Locking processes:"
     foreach ($l in $lockers) {
-        $tag = if ($l.Critical) { 'CRITICAL' } else { $l.Name }
+        $tag = if ($l.Critical) { 'CRITICAL' } elseif ($l.Source) { $l.Source } else { '' }
         Write-Host ("    PID {0,-6} {1,-20} [{2}]" -f $l.PID, $l.Name, $tag)
     }
     if ($critical.Count -gt 0) {
@@ -90,7 +178,7 @@ if (-not $item.PSIsContainer) {
         Write-Host ("  Cannot delete: {0}" -f $item.Name)
         $lockers = Get-Lockers $item.FullName
         if ($lockers.Count -gt 0) {
-            Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue }
+            Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue } | Out-Null
         }
         if (Test-Path -LiteralPath $item.FullName) { Write-Error "Could not delete: $($item.FullName)"; exit 1 }
     }
@@ -148,7 +236,7 @@ if ($total -eq 0) {
     Write-Host "Directory locked — identifying lockers..."
     $lockers = Get-Lockers $target
     if ($lockers.Count -gt 0) {
-        Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue }
+        Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue } | Out-Null
     }
     if (-not (Test-Path -LiteralPath $target)) { Write-Host "Removed."; exit 0 }
     Write-Warning "Could not remove (held open by another process): $target"; exit 1
@@ -212,7 +300,7 @@ try {
             if ($lockers.Count -gt 0) {
                 Invoke-KillAndRetry $lockers {
                     foreach ($f in $stillExist) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-                }
+                } | Out-Null
             }
         }
     }
@@ -224,7 +312,7 @@ try {
     if (Test-Path -LiteralPath $target) {
         $lockers = Get-Lockers $target
         if ($lockers.Count -gt 0) {
-            Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue }
+            Invoke-KillAndRetry $lockers { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue } | Out-Null
         }
     }
 
