@@ -173,10 +173,9 @@ try {
     foreach ($r in $results) {
         if ($r.Code -ge 8) {
             foreach ($line in $r.Output) {
-                # Robocopy error format: "YYYY/MM/DD HH:MM:SS ERROR N (0x...) <action> File <path>"
-                # or lines containing the actual file path after an ERROR line
-                if ($line -match '^\s*ERROR \d+.*Copying File\s+(.+)$') { $failedFiles.Add($Matches[1].Trim()) }
-                elseif ($line -match '^\s*ERROR \d+.*Deleting Extra File\s+(.+)$') { $failedFiles.Add($Matches[1].Trim()) }
+                if ($line -match 'ERROR.*(?:Deleting|Copying)\s+(?:File|Dir)\s+(.+)$') {
+                    $failedFiles.Add($Matches[1].Trim())
+                }
             }
         }
     }
