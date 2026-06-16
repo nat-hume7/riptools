@@ -8,8 +8,20 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+$item = Get-Item -LiteralPath $Source
+
+# ---- SINGLE FILE FAST PATH ---------------------------------------------------
+if (-not $item.PSIsContainer) {
+    $srcDir  = $item.DirectoryName
+    $srcName = $item.Name
+    $out = robocopy $srcDir $Target $srcName /MT:$Threads /R:1 /W:1
+    $code = $LASTEXITCODE
+    if ($code -ge 8) { $out | ForEach-Object { Write-Host $_ }; Write-Error "Copy failed."; exit 1 }
+    Write-Host "Done."; exit 0
+}
+
 # Resolves $Source to its full absolute path
-$srcFull = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
+$srcFull = $item.FullName.TrimEnd('\')
 
 function Get-RelDst([string]$path) {
     $rel = $path.Substring($srcFull.Length).TrimStart('\')

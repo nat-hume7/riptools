@@ -8,10 +8,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$target = (Get-Item -LiteralPath $Path).FullName.TrimEnd('\')
-if (-not (Test-Path -LiteralPath $target -PathType Container)) {
-    Write-Error "Target is not a directory: $target"; exit 1
-}
+$item = Get-Item -LiteralPath $Path
 
 # ---- RESTART MANAGER P/INVOKE ------------------------------------------------
 Add-Type -TypeDefinition @'
@@ -45,7 +42,6 @@ public static class RestartManager {
 '@ -ErrorAction SilentlyContinue
 
 function Get-FileLockers([string[]]$filePaths) {
-    # Query Restart Manager for processes holding these files (max 128 per session)
     $lockers = [System.Collections.Generic.List[object]]::new()
     for ($batch = 0; $batch -lt $filePaths.Length; $batch += 128) {
         $chunk = $filePaths[$batch..[math]::Min($batch + 127, $filePaths.Length - 1)]
@@ -72,9 +68,36 @@ function Get-FileLockers([string[]]$filePaths) {
             }
         } finally { [RestartManager]::RmEndSession($handle) | Out-Null }
     }
-    # Deduplicate by PID
     $lockers | Sort-Object PID -Unique
 }
+
+# ---- SINGLE FILE FAST PATH ---------------------------------------------------
+if (-not $item.PSIsContainer) {
+    try { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop }
+    catch {
+        Write-Host ("  Cannot delete: {0}" -f $item.Name)
+        $lockers = Get-FileLockers @($item.FullName)
+        if ($lockers.Count -gt 0) {
+            $killable = $lockers | Where-Object { -not $_.Critical }
+            Write-Host "  Locked by:"
+            foreach ($l in $lockers) {
+                $tag = if ($l.Critical) { 'CRITICAL' } elseif ($l.Restartable) { 'restartable' } else { $l.Type }
+                Write-Host ("    PID {0,-6} {1,-20} [{2}]" -f $l.PID, $l.Name, $tag)
+            }
+            $doKill = $Force -or ($(Read-Host "  Kill non-critical locker(s)? [y/N]") -match '^[yY]')
+            if ($doKill -and $killable.Count -gt 0) {
+                foreach ($l in $killable) { Stop-Process -Id $l.PID -Force -ErrorAction SilentlyContinue }
+                Start-Sleep -Milliseconds 500
+                Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+                Write-Host "Done."; exit 0
+            }
+        }
+        Write-Error "Could not delete: $($item.FullName)"; exit 1
+    }
+    Write-Host "Done."; exit 0
+}
+
+$target = $item.FullName.TrimEnd('\')
 
 # ---- 0. SCAN -----------------------------------------------------------------
 $recCount    = @{}
