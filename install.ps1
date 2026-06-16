@@ -5,7 +5,7 @@
 $ErrorActionPreference = 'Stop'
 
 $installDir = Join-Path $HOME '.riptools'
-$repo = 'https://raw.githubusercontent.com/nat-hume7/random-dev-tools/main'
+$repo = 'https://raw.githubusercontent.com/nat-hume7/riptools/main'
 
 Write-Host "Installing riptools to $installDir ..."
 

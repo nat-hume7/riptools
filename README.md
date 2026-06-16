@@ -66,7 +66,7 @@ Without `-Force`, ripdel shows the lockers and asks before killing. With `-Force
 
 One-liner:
 ```powershell
-irm https://raw.githubusercontent.com/nathume/riptools/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/nat-hume7/riptools/main/install.ps1 | iex
 ```
 
 This downloads `ripcopy.ps1`, `ripdel.ps1`, and `handle.exe` to `~/.riptools/` and adds it to your PATH.
@@ -74,7 +74,7 @@ This downloads `ripcopy.ps1`, `ripdel.ps1`, and `handle.exe` to `~/.riptools/` a
 Or clone and add to PATH manually:
 
 ```powershell
-git clone https://github.com/nathume/riptools.git
+git clone https://github.com/nat-hume7/riptools.git
 # add the cloned directory to your PATH
 ```
 
