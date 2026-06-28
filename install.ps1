@@ -1,4 +1,4 @@
-# install.ps1 — One-liner installer for riptools (ripcopy + ripdel)
+# install.ps1 — One-liner installer for riptools (ripcopy + ripdel + ripunlock)
 # Usage: irm https://raw.githubusercontent.com/<you>/random-dev-tools/main/install.ps1 | iex
 #
 # Installs to ~/.riptools/ and adds to User PATH.
@@ -13,7 +13,7 @@ Write-Host "Installing riptools to $installDir ..."
 if (-not (Test-Path $installDir)) { [void](New-Item -ItemType Directory -Path $installDir -Force) }
 
 # Download scripts
-$files = @('ripcopy.ps1', 'ripdel.ps1')
+$files = @('ripcopy.ps1', 'ripdel.ps1', 'ripunlock.ps1')
 foreach ($f in $files) {
     Write-Host "  Downloading $f ..."
     Invoke-WebRequest "$repo/$f" -OutFile (Join-Path $installDir $f) -UseBasicParsing
@@ -40,5 +40,6 @@ if ($userPath -notlike "*$installDir*") {
 & (Join-Path $installDir 'handle.exe') -accepteula >$null 2>&1
 
 Write-Host "`nDone! Commands available after PATH reload:"
-Write-Host "  ripcopy <source> <target>   # ripper-fast parallel copy"
-Write-Host "  ripdel <path> [-Force]      # ripper-fast parallel delete"
+Write-Host "  ripcopy  <source> <target>   # ripper-fast parallel copy"
+Write-Host "  ripdel   <path> [-Force]     # ripper-fast parallel delete"
+Write-Host "  ripunlock <path> [-Force]    # find and kill file/dir lockers (without deleting)"
