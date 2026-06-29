@@ -4,6 +4,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($pwsh) { & $pwsh.Source -NoProfile -File $PSCommandPath @PSBoundParameters; exit $LASTEXITCODE }
+    Write-Error "PowerShell 7+ required. Install from https://aka.ms/powershell"; exit 1
+}
+
 # =
 # ==
 # ===
@@ -112,7 +118,7 @@ if (-not (Test-Path $handleExe)) {
 #     $lockers = Get-Lockers $path          # who?
 #     Invoke-KillAndRetry $lockers { ... }  # kill + retry
 
-function Get-Lockers([string]$targetPath, [string[]]$filePaths) {
+function Get-Lockers([string]$targetPath) {
     $targetNorm = $targetPath.TrimEnd('\')
     $lockers = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[int]]::new()
@@ -131,8 +137,17 @@ function Get-Lockers([string]$targetPath, [string[]]$filePaths) {
         } catch { }
     }
 
-    # ---- Tier 2: Restart Manager (instant, file-level only) ----
-    if ($filePaths -and $filePaths.Count -gt 0) {
+    # ---- Tier 2: Restart Manager (file-level locks) ----
+    # Only enumerate files if Tier 1 found nothing — skips the expensive tree walk for the common case.
+    if ($lockers.Count -eq 0) {
+        $enumOpts = [System.IO.EnumerationOptions]@{ RecurseSubdirectories = $true; IgnoreInaccessible = $true }
+        $isDir = [System.IO.Directory]::Exists($targetPath)
+        $filePaths = if ($isDir) {
+            @([System.IO.Directory]::EnumerateFiles($targetPath, '*', $enumOpts))
+        } else {
+            @($targetPath)
+        }
+
         for ($batch = 0; $batch -lt $filePaths.Length; $batch += 128) {
             $chunk = $filePaths[$batch..[math]::Min($batch + 127, $filePaths.Length - 1)]
             $handle = 0
@@ -163,11 +178,11 @@ function Get-Lockers([string]$targetPath, [string[]]$filePaths) {
         $out = & $handleExe -a -u -accepteula $targetPath 2>&1 | Where-Object { $_ -is [string] }
         foreach ($line in $out) {
             if ($line -match '^(.+?)\s+pid:\s*(\d+)\s+type:\s*(\w+)') {
-                $pid = [int]$Matches[2]
-                if ($pid -eq $myPid -or $seen.Contains($pid)) { continue }
-                [void]$seen.Add($pid)
+                $procPid = [int]$Matches[2]
+                if ($procPid -eq $myPid -or $seen.Contains($procPid)) { continue }
+                [void]$seen.Add($procPid)
                 $procName = $Matches[1].Trim()
-                $lockers.Add([pscustomobject]@{ PID = $pid; Name = $procName; Source = 'Handle'; Critical = (& $isCritical $procName) })
+                $lockers.Add([pscustomobject]@{ PID = $procPid; Name = $procName; Source = 'Handle'; Critical = (& $isCritical $procName) })
             }
         }
     }
@@ -220,15 +235,7 @@ $target = $item.FullName.TrimEnd('\')
 
 Write-Host "Scanning for lockers on: $target"
 
-# Enumerate file paths so Restart Manager (Tier 2) can check file-level locks
-if ($item.PSIsContainer) {
-    $filePaths = @(Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue |
-                   Select-Object -ExpandProperty FullName)
-} else {
-    $filePaths = @($item.FullName)
-}
-
-$lockers = Get-Lockers $target -filePaths $filePaths
+$lockers = Get-Lockers $target
 
 if ($lockers.Count -eq 0) {
     Write-Host "No lockers found."

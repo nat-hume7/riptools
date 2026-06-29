@@ -8,6 +8,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($pwsh) { & $pwsh.Source -NoProfile -File $PSCommandPath @PSBoundParameters; exit $LASTEXITCODE }
+    Write-Error "PowerShell 7+ required. Install from https://aka.ms/powershell"; exit 1
+}
+
 $item = Get-Item -LiteralPath $Path
 
 # =
